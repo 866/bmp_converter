@@ -14,6 +14,8 @@
 
 #include "caffe/proto/caffe.pb.h"
 
+#define IMAGE_SIZE 28
+
 using namespace std;
 using namespace boost::filesystem;
 using namespace boost::algorithm;
@@ -34,7 +36,7 @@ enum LABEL_SET {DIGITS, CAP_LETTERS, SMALL_LETTERS};
 
 struct LMDB_DESCRIPTOR //principle variables for lmdb
 {
-    LMDB_DESCRIPTOR() {items_number = 0;}
+    LMDB_DESCRIPTOR() {items_index = 0; items_number = 0;}
     MDB_env *mdb_env;
     MDB_dbi mdb_dbi;
     MDB_val mdb_key, mdb_data;
@@ -44,15 +46,23 @@ struct LMDB_DESCRIPTOR //principle variables for lmdb
     int increaseItemsCounter()
     {
         mtx_.lock();
-        int ret = items_number;
-        items_number++;
+        int ret = items_index;
+        items_index++;
         mtx_.unlock();
         return ret;
     }
+    void increaseItemsNumber(int items)
+    {
+        mtx_.lock();
+        items_number += items;
+        mtx_.unlock();
+    }
+
     int getItemsNumber() const {return items_number;}
     mutex mtx_;
 private:
-    ulong items_number; //number of items
+    int items_index, items_number; //number of items
+
 };
 
 int findBlobParams(Mat& img, Rect& bounds, Point2f& centroid) //finds blob's bounds and centroid
@@ -164,7 +174,7 @@ int convertImageToLeNet(Mat& img) // opens bitmap file and returns byte array wi
         cv::Mat destinationROI = characterImage( Rect(disp.x, disp.y, bounds.width, bounds.height) ); // select region of character
         cv::Mat sourceROI =  img( bounds ); // select region of character
         sourceROI.copyTo(destinationROI); // copy character to characterImage
-        resize(characterImage, img, Size(28,28)); // resize to desired size
+        resize(characterImage, img, Size(IMAGE_SIZE,IMAGE_SIZE)); // resize to desired size
 
     }
     catch (cv::Exception)
@@ -210,8 +220,8 @@ void lmdbThread(LMDB_DESCRIPTOR* lmdb, const path* p)///LMDB_DESCRIPTOR &lmdb, p
     // Caffe neural network blob
     Datum datum;
     datum.set_channels(1);
-    datum.set_height(28);
-    datum.set_width(28);
+    datum.set_height(IMAGE_SIZE);
+    datum.set_width(IMAGE_SIZE);
 
     // Additional variables
     vec dir_elements;
@@ -219,10 +229,13 @@ void lmdbThread(LMDB_DESCRIPTOR* lmdb, const path* p)///LMDB_DESCRIPTOR &lmdb, p
     const int kMaxKeyLength = 10;         // maximum number of character in key
     char key_cstr[kMaxKeyLength];
     string value;
-
-    LOG(INFO) << "Start thread in " << *p << " folder";
+    int item_no = 0;
 
     copy(directory_iterator(*p), directory_iterator(), back_inserter(dir_elements));
+
+//    LOG(INFO) << "Start thread in " << *p << " folder( " << dir_elements.size() << ") items were found" ;
+    lmdb->increaseItemsNumber(dir_elements.size());
+
     for (vec::const_iterator it (dir_elements.begin()); it != dir_elements.end(); ++it)
     {
         string name = it->string();
@@ -232,22 +245,30 @@ void lmdbThread(LMDB_DESCRIPTOR* lmdb, const path* p)///LMDB_DESCRIPTOR &lmdb, p
                 (name.compare(name.size()-3, 3, "bmp") == 0)) //find bmp file
         {
 
+            label = getLabel(name, SMALL_LETTERS);
+
+            if (label == 26)
+                continue;
+
             Mat img(imread(name, CV_LOAD_IMAGE_GRAYSCALE)); // image from name
             if (convertImageToLeNet(img) == -1) //replace img by the LeNet img
             {
-                LOG(INFO) << name;
+                LOG(INFO) << name << " abnormal" << std::endl;
                 continue;
             }
             pixels = reinterpret_cast<char*> (img.ptr());
-            label = getLabel(name, DIGITS);
 
-            datum.set_data(pixels, 28*28);
+            item_no = lmdb->increaseItemsCounter();
+            datum.set_data(pixels, IMAGE_SIZE*IMAGE_SIZE);
             datum.set_label(label);
-            snprintf(key_cstr, kMaxKeyLength, "%08d", lmdb->increaseItemsCounter());
+            snprintf(key_cstr, kMaxKeyLength, "%08d", item_no);
             datum.SerializeToString(&value);
             string keystr(key_cstr);
+            if (item_no%1000 == 0)
+                LOG(INFO) << item_no << " out of "<< lmdb->getItemsNumber() << '('
+                          << float(item_no)/lmdb->getItemsNumber()*100 << "%) items have been processed";
 
-            LOG(INFO) << "Bmp-file " << name << " had been added.";
+//            LOG(INFO) << "Bmp-file " << name << " had been added.";
             safeStoreToDB(lmdb, value, keystr);
         }
     }
@@ -307,8 +328,7 @@ if (exists(p))    // does p actually exist?
 
         BOOST_FOREACH(work_thread current_thread, threads)
         {
-                current_thread->join();
-                LOG(INFO) << lmdb->getItemsNumber() << " items have been processed." << std::endl;
+                current_thread->join();               
         }
 
 
