@@ -4,8 +4,10 @@
 #include <boost/filesystem.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/shared_ptr.hpp>
-#include <boost/lexical_cast.hpp>
+#include <boost/date_time/posix_time/posix_time.hpp>
+#include <boost/foreach.hpp>
 #include <opencv2/opencv.hpp>
+#include <boost/thread.hpp>
 #include <lmdb.h>
 #include <glog/logging.h>
 #include <sys/stat.h>
@@ -15,13 +17,43 @@
 using namespace std;
 using namespace boost::filesystem;
 using namespace boost::algorithm;
+using namespace boost::this_thread;
 using namespace caffe;
 using namespace cv;
 
-using boost::lexical_cast;
+using boost::mutex;
+using boost::thread;
+using boost::shared_ptr;
+
+
 typedef vector< string > split_vector_type;
+typedef vector< path > vec;             // store paths
+typedef shared_ptr<boost::thread> work_thread; // pointers to threads
 
 enum LABEL_SET {DIGITS, CAP_LETTERS, SMALL_LETTERS};
+
+struct LMDB_DESCRIPTOR //principle variables for lmdb
+{
+    LMDB_DESCRIPTOR() {items_number = 0;}
+    MDB_env *mdb_env;
+    MDB_dbi mdb_dbi;
+    MDB_val mdb_key, mdb_data;
+    MDB_txn *mdb_txn;
+    void lock() { mtx_.lock(); }
+    void unlock() { mtx_.unlock(); }
+    int increaseItemsCounter()
+    {
+        mtx_.lock();
+        int ret = items_number;
+        items_number++;
+        mtx_.unlock();
+        return ret;
+    }
+    int getItemsNumber() const {return items_number;}
+    mutex mtx_;
+private:
+    ulong items_number; //number of items
+};
 
 int findBlobParams(Mat& img, Rect& bounds, Point2f& centroid) //finds blob's bounds and centroid
                                                                       //returns number of blobs points
@@ -94,28 +126,57 @@ char getClassSmallLetters(char label) // returns the class of the given characte
     return res;
 }
 
-void convertImageToLeNet(Mat& img) // opens bitmap file and returns byte array with the pixels of transformed image
+int convertImageToLeNet(Mat& img) // opens bitmap file and returns byte array with the pixels of transformed image
 {
     Rect bounds;
     Point2f cm;
 
     bitwise_not(img, img); // color inversion for LeNet
 
-    findBlobParams(img, bounds, cm);//finds certain character position
+    findBlobParams(img, bounds, cm);  //finds certain character position
 
     int max_side = static_cast<int>((max(bounds.width, bounds.height))*1.4); // image should have sides equal to maximum side of character's frame
 
-    Mat characterImage = Mat::zeros(max_side, max_side, img.type()); // here we will store image that is compatible with LeNet
-    Point2i disp = (Point2f(0.5*max_side, 0.5*max_side)-cm);// displacement of cantroid
+    try
+    {
+        Mat characterImage = Mat::zeros(max_side, max_side, img.type()); // here we will store image that is compatible with LeNet
+        Point2i disp = (Point2f(0.5*max_side, 0.5*max_side)-cm);// displacement of centroid
 
-    cv::Mat destinationROI = characterImage( Rect(disp.x, disp.y, bounds.width, bounds.height) ); // select region of character
-    cv::Mat sourceROI =  img( bounds ); // select region of character
-    sourceROI.copyTo(destinationROI); // copy character to characterImage
+    //    cout << "X: " << (disp.x + bounds.x) << " Y:" << (disp.y + bounds.y) << " Size:" << characterImage.size() << std::endl;
+        int yieldX = characterImage.size().width - (disp.x + bounds.width); // cut the boundaries,
+        int yieldY = characterImage.size().height - (disp.y + bounds.height); // if cut image does not fit destination image
+        if (yieldX < 0)
+            bounds.width += yieldX;
+        if (yieldY < 0)
+            bounds.height += yieldY;
+        //cout <<  "Disp" << disp << std::endl;
 
-    resize(characterImage, img, Size(28,28)); // resize to desired size
+        if (disp.x < 0)
+            disp.x = 0;
+        if (disp.y < 0)
+            disp.y = 0;
+
+//        cout << "X1: " << (disp.x + bounds.x) << " Y1:" << (disp.y + bounds.y)
+//             << "X2: " << disp.x + bounds.width << " Y2:" << (disp.y + bounds.height)
+//             << " Size:" << characterImage.size() << std::endl;
+//        cout << "Rect: " << Rect(disp.x, disp.y, bounds.width, bounds.height) << characterImage.size();
+
+        cv::Mat destinationROI = characterImage( Rect(disp.x, disp.y, bounds.width, bounds.height) ); // select region of character
+        cv::Mat sourceROI =  img( bounds ); // select region of character
+        sourceROI.copyTo(destinationROI); // copy character to characterImage
+        resize(characterImage, img, Size(28,28)); // resize to desired size
+
+    }
+    catch (cv::Exception)
+    {
+        return -1;
+    }
+
+
+    return 0;
 }
 
-short getLabel(string path, LABEL_SET type)
+char getLabel(string path, LABEL_SET type) // returns class of the label
 {
     split_vector_type SplitVec;
     split( SplitVec, path, is_any_of("_"), token_compress_on );
@@ -129,6 +190,70 @@ short getLabel(string path, LABEL_SET type)
         case SMALL_LETTERS:
             return getClassSmallLetters(clabel);
     }
+}
+
+void safeStoreToDB(LMDB_DESCRIPTOR* lmdb, string& value, string& keystr)
+{
+    lmdb->lock(); //Create thread-safe access to lmdb
+    lmdb->mdb_data.mv_size = value.size();
+    lmdb->mdb_data.mv_data = reinterpret_cast<void*>(&value[0]);
+    lmdb->mdb_key.mv_size = keystr.size();
+    lmdb->mdb_key.mv_data = reinterpret_cast<void*>(&keystr[0]);
+    CHECK_EQ(mdb_put(lmdb->mdb_txn, lmdb->mdb_dbi, &lmdb->mdb_key, &lmdb->mdb_data, 0), MDB_SUCCESS)
+        << "mdb_put failed";
+    lmdb->unlock(); //Unlock access to lmdb
+}
+
+void lmdbThread(LMDB_DESCRIPTOR* lmdb, const path* p)///LMDB_DESCRIPTOR &lmdb, path p) //separate thread for working with certain folder
+{
+    //path* p = (reinterpret_cast<path*> (path_ptr) );
+    // Caffe neural network blob
+    Datum datum;
+    datum.set_channels(1);
+    datum.set_height(28);
+    datum.set_width(28);
+
+    // Additional variables
+    vec dir_elements;
+    char *pixels, label;                  // image and class
+    const int kMaxKeyLength = 10;         // maximum number of character in key
+    char key_cstr[kMaxKeyLength];
+    string value;
+
+    LOG(INFO) << "Start thread in " << *p << " folder";
+
+    copy(directory_iterator(*p), directory_iterator(), back_inserter(dir_elements));
+    for (vec::const_iterator it (dir_elements.begin()); it != dir_elements.end(); ++it)
+    {
+        string name = it->string();
+
+        if ((is_regular_file(*it)) &&
+                (name.size()>3) &&
+                (name.compare(name.size()-3, 3, "bmp") == 0)) //find bmp file
+        {
+
+            Mat img(imread(name, CV_LOAD_IMAGE_GRAYSCALE)); // image from name
+            if (convertImageToLeNet(img) == -1) //replace img by the LeNet img
+            {
+                LOG(INFO) << name;
+                continue;
+            }
+            pixels = reinterpret_cast<char*> (img.ptr());
+            label = getLabel(name, DIGITS);
+
+            datum.set_data(pixels, 28*28);
+            datum.set_label(label);
+            snprintf(key_cstr, kMaxKeyLength, "%08d", lmdb->increaseItemsCounter());
+            datum.SerializeToString(&value);
+            string keystr(key_cstr);
+
+            LOG(INFO) << "Bmp-file " << name << " had been added.";
+            safeStoreToDB(lmdb, value, keystr);
+        }
+    }
+
+    LOG(INFO) << "End thread in " << *p << " folder";
+
 }
 
 int main(int argc, char* argv[])
@@ -151,85 +276,55 @@ if (exists(p))    // does p actually exist?
       else if (is_directory(p))      // is p a directory?
       {
 
-        // lmdb
-        MDB_env *mdb_env;
-        MDB_dbi mdb_dbi;
-        MDB_val mdb_key, mdb_data;
-        MDB_txn *mdb_txn;
+        shared_ptr<LMDB_DESCRIPTOR> lmdb(new LMDB_DESCRIPTOR()); // single lmdb for whole program
+        vec dir_elements;
 
-        // Caffe neural network blob
-        Datum datum;
-        datum.set_channels(1);
-        datum.set_height(28);
-        datum.set_width(28);
-
-        //additional vars
-        typedef vector<path> vec;             // store paths,
-        vec v;                                // so we can sort them later
-        char label;                           // label
-        const int kMaxKeyLength = 10;
-        char key_cstr[kMaxKeyLength];
         char *pixels, *db_path = argv[2];
         string value;
-        int item_id = 0;
 
         LOG(INFO) << "Opening lmdb " << db_path;
-        CHECK_EQ(mkdir(db_path, 0744), 0)
-            << "mkdir " << db_path << "failed";
-        CHECK_EQ(mdb_env_create(&mdb_env), MDB_SUCCESS) << "mdb_env_create failed";
-        CHECK_EQ(mdb_env_set_mapsize(mdb_env, 1099511627776), MDB_SUCCESS)  // 1TB
+//        CHECK_EQ(mkdir(db_path, 0744), 0)
+//            << "mkdir " << db_path << "failed";
+        CHECK_EQ(mdb_env_create(&lmdb->mdb_env), MDB_SUCCESS) << "mdb_env_create failed";
+        CHECK_EQ(mdb_env_set_mapsize(lmdb->mdb_env, 1099511627776), MDB_SUCCESS)  // 1TB
             << "mdb_env_set_mapsize failed";
-        CHECK_EQ(mdb_env_open(mdb_env, db_path, 0, 0664), MDB_SUCCESS)
+        CHECK_EQ(mdb_env_open(lmdb->mdb_env, db_path, 0, 0664), MDB_SUCCESS)
             << "mdb_env_open failed";
-        CHECK_EQ(mdb_txn_begin(mdb_env, NULL, 0, &mdb_txn), MDB_SUCCESS)
+        CHECK_EQ(mdb_txn_begin(lmdb->mdb_env, NULL, 0, &lmdb->mdb_txn), MDB_SUCCESS)
             << "mdb_txn_begin failed";
-        CHECK_EQ(mdb_open(mdb_txn, NULL, 0, &mdb_dbi), MDB_SUCCESS)
+        CHECK_EQ(mdb_open(lmdb->mdb_txn, NULL, 0, &lmdb->mdb_dbi), MDB_SUCCESS)
             << "mdb_open failed. Does the lmdb already exist? ";
 
-        copy(directory_iterator(p), directory_iterator(), back_inserter(v));
-        for (vec::const_iterator it (v.begin()); it != v.end(); ++it)
-        {
+        copy(directory_iterator(p), directory_iterator(), back_inserter(dir_elements));
+        LOG(INFO) << "Found " << dir_elements.size() << " in " << p;
 
-            string name = it->string();
-
-            if ((is_regular_file(*it)) &&
-                    (name.size()>3) &&
-                    (name.compare(name.size()-3, 3, "bmp") == 0)) //find bmp file
+        vector<work_thread> threads;
+        for (vec::const_iterator it (dir_elements.begin()); it != dir_elements.end(); ++it)
+            if (is_directory(*it))
             {
-                Mat img(imread(name, CV_LOAD_IMAGE_GRAYSCALE)); // image from name
-                convertImageToLeNet(img);
-                pixels = reinterpret_cast<char*> (img.ptr());
-                label = getLabel(name, DIGITS);
-
-                datum.set_data(pixels, 28*28);
-                datum.set_label(label);
-                snprintf(key_cstr, kMaxKeyLength, "%08d", item_id);
-                datum.SerializeToString(&value);
-                string keystr(key_cstr);
-
-                mdb_data.mv_size = value.size();
-                mdb_data.mv_data = reinterpret_cast<void*>(&value[0]);
-                mdb_key.mv_size = keystr.size();
-                mdb_key.mv_data = reinterpret_cast<void*>(&keystr[0]);
-                CHECK_EQ(mdb_put(mdb_txn, mdb_dbi, &mdb_key, &mdb_data, 0), MDB_SUCCESS)
-                    << "mdb_put failed";
-
-                item_id++;
+                threads.push_back(work_thread(new boost::thread(lmdbThread, lmdb.get(), &(*it))));
             }
-        }
-        //close db
-        CHECK_EQ(mdb_txn_commit(mdb_txn), MDB_SUCCESS)
-            << "mdb_txn_commit failed";
-        CHECK_EQ(mdb_txn_begin(mdb_env, NULL, 0, &mdb_txn), MDB_SUCCESS)
-            << "mdb_txn_begin failed";
-        CHECK_EQ(mdb_txn_commit(mdb_txn), MDB_SUCCESS) << "mdb_txn_commit failed";
-        mdb_close(mdb_env, mdb_dbi);
-        mdb_env_close(mdb_env);
 
-        cout << item_id << " items have been processed and stored to the database.";
+        BOOST_FOREACH(work_thread current_thread, threads)
+        {
+                current_thread->join();
+                LOG(INFO) << lmdb->getItemsNumber() << " items have been processed." << std::endl;
+        }
+
+
+        //close db
+        CHECK_EQ(mdb_txn_commit(lmdb->mdb_txn), MDB_SUCCESS)
+            << "mdb_txn_commit failed";
+        CHECK_EQ(mdb_txn_begin(lmdb->mdb_env, NULL, 0, &lmdb->mdb_txn), MDB_SUCCESS)
+            << "mdb_txn_begin failed";
+        CHECK_EQ(mdb_txn_commit(lmdb->mdb_txn), MDB_SUCCESS) << "mdb_txn_commit failed";
+        mdb_close(lmdb->mdb_env, lmdb->mdb_dbi);
+        mdb_env_close(lmdb->mdb_env);
+
+        LOG(INFO) << lmdb->getItemsNumber() << " items have been processed and stored to the database." << std::endl;
       }
       else
-        cout << p << " exists, but is neither a regular file nor a directory\n";
+        cout << p << " exists, but is neither a regular file nor a directory\n" << std::endl;
     }
 
 
