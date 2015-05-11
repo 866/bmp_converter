@@ -22,8 +22,7 @@ add_executable(${PROJECT_NAME} ${SRC_LIST})
 
 message(${OpenCV_INCLUDE_DIRS})
 #Add linking libraries
-set( CAFFE_LIBRARY "/home/victor/Programming/caffe-master/build/lib/libcaffe.so"
-                    "/home/victor/anaconda/lib/libhdf5_hl.so.9")
+set( CAFFE_LIBRARY "/home/victor/Programming/caffe/build/lib/libcaffe.so")
 
 target_link_libraries(bmp_converter ${Boost_LIBRARIES} ${GLOG_LIBRARIES} ${LevelDB_LIBRARY}
                     ${LMDB_LIBRARIES} ${GFLAGS_LIBRARIES} ${PROTOBUF_LIBRARIES} ${CAFFE_LIBRARY}

@@ -31,7 +31,6 @@ using boost::mutex;
 using boost::thread;
 using boost::shared_ptr;
 
-
 typedef vector< string > split_vector_type;
 typedef vector< path > vec;             // store paths
 
