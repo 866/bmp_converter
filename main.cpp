@@ -14,17 +14,10 @@
 
 #include "caffe/proto/caffe.pb.h"
 
-<<<<<<< HEAD
-#define IMAGE_SIZE 36
+#define IMAGE_SIZE 28
 #define SCALE_FACTOR 1.5
 #define MAXIMUM_NUMBER_OF_THREADS 10
 #define DISPLAY_PERIOD 3000
-=======
-#define IMAGE_SIZE 28
-#define MAXIMUM_NUMBER_OF_THREADS 20
-#define DISPLAY_PERIOD 3000
-#define TARGET_SET SMALL_LETTERS
->>>>>>> 38b2508a1084a7c520a5c8c82bef0e1325023a0a
 
 
 using namespace std;
@@ -40,10 +33,6 @@ using boost::shared_ptr;
 
 typedef vector< string > split_vector_type;
 typedef vector< path > vec;             // store paths
-<<<<<<< HEAD
-=======
-typedef shared_ptr< boost::thread > work_thread;
->>>>>>> 38b2508a1084a7c520a5c8c82bef0e1325023a0a
 
 enum LABEL_SET {DIGITS, CAP_LETTERS, SMALL_LETTERS};
 
@@ -331,7 +320,6 @@ void lmdbThread(LMDB_DESCRIPTOR* lmdb, const path* p)///LMDB_DESCRIPTOR &lmdb, p
 }
 
 ulong getFilesNumber(const path& p)
-<<<<<<< HEAD
 {
     vec dir_elements;
     ulong elements_number = 0;
@@ -347,31 +335,6 @@ ulong getFilesNumber(const path& p)
     LOG(INFO) << "Counting is finished. " << elements_number << " files are found." << std::endl;
     return elements_number;
 }
-=======
-{
-    vec dir_elements;
-    ulong elements_number = 0;
-    LOG(INFO) << "Counting files within folders..."<< std::endl;
-    copy(directory_iterator(p), directory_iterator(), back_inserter(dir_elements));
-    for(vec::const_iterator it=dir_elements.begin(); it != dir_elements.end(); ++it)
-        if (is_directory(*it))
-        {
-            vec dir_elements_within;
-            copy(directory_iterator(*it), directory_iterator(), back_inserter(dir_elements_within));
-            elements_number += dir_elements_within.size();
-        }
-    LOG(INFO) << "Counting is finished. " << elements_number << " files are found." << std::endl;
-    return elements_number;
-}
-
-int main(int argc, char* argv[])
-{
-    if (argc < 3)
-  {
-    cout << "Usage: bmp_converter <path> <db>\n";
-    return 1;
-  }
->>>>>>> 38b2508a1084a7c520a5c8c82bef0e1325023a0a
 
 int main(int argc, char* argv[])
 {
@@ -424,13 +387,8 @@ int main(int argc, char* argv[])
             boost::thread_group thread_group;
             for(int thread_num = 0; thread_num < MAXIMUM_NUMBER_OF_THREADS && it != dir_elements.end(); ++thread_num)
             {
-<<<<<<< HEAD
                 boost::thread* current_thread = new boost::thread(lmdbThread, lmdb.get(), &(*it));  //thread group frees all thread objects after destruction
                 thread_group.add_thread(current_thread); // so there is no need to manage this process
-=======
-                boost::thread* current_thread = new boost::thread(lmdbThread, lmdb.get(), &(*it));  //thread group removes all threads after destruction
-                thread_group.add_thread(current_thread); // so there is no need to controll this process
->>>>>>> 38b2508a1084a7c520a5c8c82bef0e1325023a0a
                 it++; // http://www.boost.org/doc/libs/1_35_0/doc/html/thread/thread_management.html#thread.thread_management.threadgroup.destructor
             }
             thread_group.join_all();
