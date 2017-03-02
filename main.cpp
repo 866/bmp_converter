@@ -54,6 +54,7 @@ struct LMDB_DESCRIPTOR //principle variables for lmdb
     void unlock() { mtx_.unlock(); }
     int increaseItemsCounter()
     {
+	// lock mutex when we need to increase counter
         mtx_.lock();
         int ret = items_index;
         items_index++;
